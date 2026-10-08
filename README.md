@@ -59,8 +59,7 @@ core files are patched.
    ```
    koreader/plugins/menucustomizer.koplugin/
    ├── _meta.lua
-   ├── main.lua
-   └── README.md
+   └── main.lua
    ```
 
 3. Restart KOReader.
