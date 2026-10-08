@@ -14,14 +14,14 @@ core files are patched.
 <table>
   <tr>
     <td align="center">
-      <img width="571" height="379" alt="Main UI" src="https://github.com/user-attachments/assets/f78e68f8-23ab-45d0-8469-583c833c00e1" />
+      <img width="600" height="520" alt="2" src="https://github.com/user-attachments/assets/1895b99c-c32c-4b1a-9d24-d20784e51eeb" />
       <br>
-      <em>Main UI</em>
+      <em>Main menu</em>
     </td>
     <td align="center">
-      <img width="676" height="350" alt="Edit tap zones" src="https://github.com/user-attachments/assets/91096a56-73fb-45db-a8fb-aa5f6bb0dfae" />
+      <img width="600" height="575" alt="1" src="https://github.com/user-attachments/assets/8174d88c-d953-414e-b3e5-313e9d4556f9" />
       <br>
-      <em>Edit tap zones</em>
+      <em>Edit menu</em>
     </td>
   </tr>
 </table>
