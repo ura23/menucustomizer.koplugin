@@ -9,6 +9,23 @@ The plugin writes native KOReader `*_menu_order.lua` override files, so your
 customizations are applied by KOReader's own menu sorter after a restart. No
 core files are patched.
 
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center">
+      <img width="571" height="379" alt="Main UI" src="https://github.com/user-attachments/assets/f78e68f8-23ab-45d0-8469-583c833c00e1" />
+      <br>
+      <em>Main UI</em>
+    </td>
+    <td align="center">
+      <img width="676" height="350" alt="Edit tap zones" src="https://github.com/user-attachments/assets/91096a56-73fb-45db-a8fb-aa5f6bb0dfae" />
+      <br>
+      <em>Edit tap zones</em>
+    </td>
+  </tr>
+</table>
+
 ## Features
 
 - **Human‑readable labels (main feature)** — the editor shows the real menu
