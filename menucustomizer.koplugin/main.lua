@@ -21,6 +21,8 @@ settings directory so that MenuSorter picks them up on restart.
 -- Version 1.10: auto-restart KOReader after applying or resetting menu changes (falls back to the manual-restart message when a programmatic restart is unavailable).
 -- Version 1.11: localized all user-visible strings (en/uk via tr/trn) instead of gettext _(); fixes Ukrainian text showing under an English KOReader locale.
 -- Version 1.12: renamed the English menu label from "Menu settings" to "Menu customizer".
+-- Version 1.13: preserve top-level tabs added at runtime by third-party plugins (custom_tabs_*). They are discovered from the live order table, persisted (id -> label, id -> predecessor) and re-injected into KOMenu:menu_buttons in the generated override file so they are not dropped. The tab contents are intentionally left untouched: the override never emits the tab's item-list key.
+-- Version 1.14: custom-tab items are editable again (children are discovered under the tab and shown in its submenu). Keeps the empty-tab safeguard (the tab's item-list key is emitted only when a non-empty child list was discovered) and stops pruning the disable flag of custom-tab items, so a disabled child stays disabled across restarts.
 
 local ButtonDialog = require("ui/widget/buttondialog")
 local DataStorage = require("datastorage")
@@ -166,6 +168,10 @@ local function loadSettingsFromDisk()
             data.custom_items_filemanager = data.custom_items_filemanager or {}
             data.items_order_reader = data.items_order_reader or {}
             data.items_order_filemanager = data.items_order_filemanager or {}
+            data.custom_tabs_reader = data.custom_tabs_reader or {}
+            data.custom_tabs_filemanager = data.custom_tabs_filemanager or {}
+            data.custom_tabs_after_reader = data.custom_tabs_after_reader or {}
+            data.custom_tabs_after_filemanager = data.custom_tabs_after_filemanager or {}
             -- Inline submenu caches moved to INLINE_SETTINGS_FILE in v1.9. Keep
             -- the legacy embedded arrays for a one-time migration, then drop
             -- them from the settings table so they are no longer serialized.
@@ -203,6 +209,10 @@ local function loadSettingsFromDisk()
         custom_items_order_filemanager = {},
         items_order_reader = {},
         items_order_filemanager = {},
+        custom_tabs_reader = {},
+        custom_tabs_filemanager = {},
+        custom_tabs_after_reader = {},
+        custom_tabs_after_filemanager = {},
         hide_unavailable = true,
     }
 end
@@ -376,7 +386,7 @@ local function saveSettings(settings)
     local function writeTextCache(name, tbl)
         out("    " .. name .. " = {\n")
         for k, v in pairs(tbl) do
-            if type(v) == "string" and v ~= "" then
+            if type(v) == "string" then
                 out(string.format("        [%q] = %q,\n", k, v))
             elseif v == false then
                 out(string.format("        [%q] = false,\n", k))
@@ -421,6 +431,10 @@ local function saveSettings(settings)
     writeOrderedItems("custom_items_order_filemanager", settings.custom_items_order_filemanager or {})
     writeOrderedItems("items_order_reader", settings.items_order_reader or {})
     writeOrderedItems("items_order_filemanager", settings.items_order_filemanager or {})
+    writeTextCache("custom_tabs_reader", settings.custom_tabs_reader or {})
+    writeTextCache("custom_tabs_filemanager", settings.custom_tabs_filemanager or {})
+    writeTextCache("custom_tabs_after_reader", settings.custom_tabs_after_reader or {})
+    writeTextCache("custom_tabs_after_filemanager", settings.custom_tabs_after_filemanager or {})
     out(string.format("    hide_unavailable = %s,\n", settings.hide_unavailable and "true" or "false"))
     out("}\n")
 
@@ -620,11 +634,76 @@ local function applyItemsOrder(order, items_order)
     end
 end
 
+--- Re-inject top-level tabs added at runtime by third-party plugins into the
+--- pristine order (they are absent from the file on disk). Each tab is placed
+--- right after the tab that preceded it when it was first discovered.
+--- We materialize order[tab_id] (so the editor can show and toggle the tab's
+--- items) ONLY when a non-empty child list was discovered for it. If nothing
+--- was discovered, order[tab_id] is left nil: the generated override then
+--- omits the tab's item-list key entirely, so MenuSorter keeps the plugin's
+--- own runtime list verbatim instead of replacing it with an empty snapshot.
+local function injectCustomTabs(order, settings, mode)
+    local tabs = (mode == "reader") and settings.custom_tabs_reader or settings.custom_tabs_filemanager
+    local afters = (mode == "reader") and settings.custom_tabs_after_reader or settings.custom_tabs_after_filemanager
+    local custom_items_order = (mode == "reader") and settings.custom_items_order_reader or settings.custom_items_order_filemanager
+    local buttons = order["KOMenu:menu_buttons"]
+    if type(tabs) ~= "table" or type(buttons) ~= "table" then return end
+
+    local present = {}
+    for _, id in ipairs(buttons) do present[id] = true end
+
+    local pending = {}
+    for id in pairs(tabs) do
+        local children = custom_items_order and custom_items_order[id]
+        if type(children) == "table" and #children > 0 and type(order[id]) ~= "table" then
+            order[id] = {}
+        end
+        if not present[id] then
+            table.insert(pending, id)
+        end
+    end
+    table.sort(pending)
+
+    while #pending > 0 do
+        local remaining = {}
+        local progress = false
+        for _, id in ipairs(pending) do
+            local after = afters and afters[id] or ""
+            local idx
+            if after == "" then
+                idx = 0
+            else
+                for i, b in ipairs(buttons) do
+                    if b == after then
+                        idx = i
+                        break
+                    end
+                end
+            end
+            if idx then
+                table.insert(buttons, idx + 1, id)
+                progress = true
+            else
+                table.insert(remaining, id)
+            end
+        end
+        if not progress then
+            -- Predecessor is gone: just append the leftovers.
+            for _, id in ipairs(remaining) do
+                table.insert(buttons, id)
+            end
+            break
+        end
+        pending = remaining
+    end
+end
+
 --- Get the effective order table for a given mode, merging the default
 --- built-in order with any dynamically discovered custom menu items from
 --- third-party plugins.
 local function getEffectiveOrder(mode, settings)
     local order = getDefaultOrder(mode)
+    injectCustomTabs(order, settings, mode)
     local custom_items_order = (mode == "reader") and settings.custom_items_order_reader or settings.custom_items_order_filemanager
     if custom_items_order then
         -- Insert custom items in the saved deterministic order
@@ -689,7 +768,7 @@ local function serializeOrder(order)
     for _, k in ipairs(keys) do
         local v = order[k]
         if type(v) == "table" then
-            table.insert(lines, string.format("    %s = {", k))
+            table.insert(lines, string.format("    [%q] = {", k))
             for _, item in ipairs(v) do
                 table.insert(lines, string.format("        %q,", item))
             end
@@ -896,6 +975,14 @@ local function resolveTabLabel(tab_id, text_lookup)
     local source = localizedSource(tab_id)
     if source then
         return source
+    end
+    -- Tabs added by third-party plugins: label remembered at discovery time.
+    local s = getSettings()
+    for _, tbl in ipairs({ s.custom_tabs_reader, s.custom_tabs_filemanager }) do
+        local label = type(tbl) == "table" and tbl[tab_id]
+        if type(label) == "string" and label ~= "" then
+            return label
+        end
     end
     return tab_id
 end
@@ -1841,6 +1928,76 @@ end
 -- Plugin lifecycle
 -- ────────────────────────────────────────────────────────────────────
 
+--- Discover top-level tabs that a third-party plugin added to the live
+--- KOMenu:menu_buttons (they are not part of the pristine order on disk).
+--- Persists id -> label and id -> predecessor tab so getEffectiveOrder() can
+--- re-inject them. Returns (changed, tab_set) where tab_set holds every known
+--- custom tab id (live or remembered), so callers never mistake a tab
+--- definition in item_table for an ordinary menu item and never copy the
+--- tab's contents into custom_items_order_* (that would make the override
+--- file rewrite the plugin's own item list).
+local function discoverCustomTabs(config_prefix, item_table, order, settings, default_order)
+    local tab_set = {}
+    local buttons = order["KOMenu:menu_buttons"]
+    local tabs_key = "custom_tabs_" .. config_prefix
+    local after_key = "custom_tabs_after_" .. config_prefix
+    settings[tabs_key] = settings[tabs_key] or {}
+    settings[after_key] = settings[after_key] or {}
+    local tabs, afters = settings[tabs_key], settings[after_key]
+    local disabled_tabs = (config_prefix == "reader") and settings.reader_tabs_disabled or settings.filemanager_tabs_disabled
+
+    for id in pairs(tabs) do tab_set[id] = true end
+    if type(buttons) ~= "table" then return false, tab_set end
+
+    local default_tabs = {}
+    for _, id in ipairs(default_order["KOMenu:menu_buttons"] or {}) do
+        default_tabs[id] = true
+    end
+
+    local changed = false
+    local live = {}
+    local prev = ""
+    for _, id in ipairs(buttons) do
+        if type(id) == "string" and id ~= SEPARATOR_ID and not default_tabs[id] and not TAB_IDS[id] then
+            live[id] = true
+            tab_set[id] = true
+            local label = tabs[id]
+            local def = type(item_table) == "table" and item_table[id] or nil
+            if type(def) == "table" and type(def.text) == "string" and def.text ~= "" then
+                label = def.text
+            elseif not label then
+                label = id
+            end
+            if tabs[id] ~= label then
+                tabs[id] = label
+                changed = true
+            end
+            -- Remember the position only once, on first discovery: later
+            -- live lists may already have disabled tabs stripped out.
+            if afters[id] == nil then
+                afters[id] = prev
+                changed = true
+            end
+        end
+        prev = id
+    end
+
+    -- Forget tabs that vanished (plugin removed/disabled). A tab the user
+    -- disabled is missing from the live list by design, so keep it.
+    for id in pairs(tabs) do
+        if not live[id] and not (disabled_tabs and disabled_tabs[id]) then
+            tabs[id] = nil
+            afters[id] = nil
+            tab_set[id] = nil
+            local items_order = (config_prefix == "reader") and settings.items_order_reader or settings.items_order_filemanager
+            if items_order then items_order[id] = nil end
+            changed = true
+        end
+    end
+
+    return changed, tab_set
+end
+
 --- Discover third-party plugin items before MenuSorter applies override files.
 --- This catches:
 ---   1. Items explicitly inserted by plugins into submenus of 'order' during addToMainMenu
@@ -1852,6 +2009,10 @@ local function discoverCustomItemsBeforeSort(config_prefix, item_table, order, s
 
     local default_order = getDefaultOrder(config_prefix)
     local known_ids = collectKnownIds(default_order)
+    local tabs_changed, tab_set = discoverCustomTabs(config_prefix, item_table, order, settings, default_order)
+    for id in pairs(tab_set) do
+        known_ids[id] = true -- a custom tab is a container, never a plain item
+    end
     local custom_items = (config_prefix == "reader") and settings.custom_items_reader or settings.custom_items_filemanager
     if not custom_items then
         custom_items = {}
@@ -1926,7 +2087,7 @@ local function discoverCustomItemsBeforeSort(config_prefix, item_table, order, s
     end
 
     -- Update custom_items hash
-    local changed = false
+    local changed = tabs_changed
     for id, parent in pairs(discovered) do
         if custom_items[id] ~= parent then
             custom_items[id] = parent
@@ -1937,10 +2098,15 @@ local function discoverCustomItemsBeforeSort(config_prefix, item_table, order, s
     -- Prune custom items that are no longer present
     for id in pairs(custom_items) do
         if not discovered[id] then
+            local parent = custom_items[id]
             custom_items[id] = nil
             local disabled_tbl = (config_prefix == "reader") and settings.reader_disabled or settings.filemanager_disabled
             local cache_tbl = (config_prefix == "reader") and settings.text_cache_reader or settings.text_cache_filemanager
-            if disabled_tbl and disabled_tbl[id] ~= nil then
+            -- Keep the disable flag for items that belong to a custom tab: a
+            -- disabled child is removed from the live tab list by our own
+            -- override, so on a later re-scan it can look "vanished" and would
+            -- be silently re-enabled. Keeping the flag makes the disable stick.
+            if disabled_tbl and disabled_tbl[id] ~= nil and not (parent and tab_set[parent]) then
                 disabled_tbl[id] = nil
             end
             if cache_tbl and cache_tbl[id] ~= nil then
@@ -2216,6 +2382,10 @@ function MenuCustomizer:addToMainMenu(menu_items)
                         custom_items_order_filemanager = {},
                         items_order_reader = {},
                         items_order_filemanager = {},
+                        custom_tabs_reader = {},
+                        custom_tabs_filemanager = {},
+                        custom_tabs_after_reader = {},
+                        custom_tabs_after_filemanager = {},
                         hide_unavailable = true,
                     }
                     saveSettings(settings)
