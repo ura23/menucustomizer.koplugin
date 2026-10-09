@@ -47,7 +47,9 @@ core files are patched.
   nested "inline" submenus.
 - **Third‑party plugin support** — new items registered by other plugins *inside
   existing tabs and submenus* are discovered automatically and become
-  customizable. See the note in Usage.
+  customizable. Menu‑order **top‑level tabs** (e.g. Bookshelf) are preserved and
+  editable too, while runtime‑injected tabs (Zen UI/ZenOS, Simple UI) are left
+  untouched. See the note in Usage.
 - **No more `NEW:` orphans** — menu items that appear *after* you already
   generated the order file (e.g. a plugin you installed or updated later) are
   picked up automatically and inserted into their correct parent menu on the
@@ -95,10 +97,17 @@ core files are patched.
 >   hierarchy while in a mode also refreshes that mode's cache automatically.
 
 > [!NOTE]
-> **Third‑party tabs are not supported.** The plugin can customize items that
-> third‑party plugins add *inside* existing tabs and submenus, but it does not
-> handle new **top‑level tabs** added by third‑party plugins: such tabs are
-> neither discovered nor editable here.
+> **Third‑party tabs are partially supported.** How a tab is handled depends on
+> how the plugin adds it:
+> - **Menu‑order tabs** — declared by patching `ui/elements/*_menu_order` and
+>   `KOMenu:menu_buttons` (e.g. **Bookshelf**) — are discovered, kept in the
+>   generated override file and shown in the editor, so their items can be
+>   enabled/disabled like any other. The override never writes an empty item
+>   list for such a tab, so the tab is never wiped.
+> - **Runtime tabs** — injected straight into `tab_item_table` after sorting
+>   (e.g. **Zen UI**, **ZenOS**, **Simple UI**) — are added by their own plugin
+>   *after* the menu is sorted, so Menu Customizer never lists nor modifies them;
+>   they stay exactly as the plugin made them.
 
 Open the menu and go to **Tools → More tools → Menu customizer** (the entry is
 added to the `more_tools` submenu of the Tools tab in both modes).
@@ -131,9 +140,13 @@ The plugin hooks `MenuSorter:mergeAndSort` to:
 
 1. Discover custom items registered by third‑party plugins and remember their
    parent menu.
-2. Filter out disabled items from the live `tab_item_table` (including items in
+2. Preserve **menu‑order top‑level tabs** (e.g. Bookshelf): remember each tab's
+   label and position, re‑insert its id into `KOMenu:menu_buttons`, and never
+   emit an empty item list for it (so the tab can neither be dropped nor wiped).
+   Runtime‑injected tabs (Zen UI/ZenOS, Simple UI) are not touched at all.
+3. Filter out disabled items from the live `tab_item_table` (including items in
    inline submenus that have no stable `id`).
-3. Generate `reader_menu_order.lua` / `filemanager_menu_order.lua` in KOReader's
+4. Generate `reader_menu_order.lua` / `filemanager_menu_order.lua` in KOReader's
    settings directory, which `MenuSorter` picks up on the next start.
 
 Menu labels for items that are not present in the currently active mode are
@@ -144,7 +157,7 @@ readable names instead of raw ids.
 
 | File | Location | Purpose |
 |---|---|---|
-| `menu_customizer.lua` | KOReader settings dir | Plugin settings (disabled sets, ordering, label cache). |
+| `menu_customizer.lua` | KOReader settings dir | Plugin settings (disabled sets, ordering, custom top‑level tabs, label cache). |
 | `menu_customizer_inline.lua` | KOReader settings dir | Cached nested inline submenus (loaded lazily). |
 | `reader_menu_order.lua` | KOReader settings dir | Generated Reader menu order override. |
 | `filemanager_menu_order.lua` | KOReader settings dir | Generated File Browser menu order override. |
