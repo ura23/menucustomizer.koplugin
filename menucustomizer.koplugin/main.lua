@@ -21,11 +21,16 @@ settings directory so that MenuSorter picks them up on restart.
 -- Version 1.10: auto-restart KOReader after applying or resetting menu changes (falls back to the manual-restart message when a programmatic restart is unavailable).
 -- Version 1.11: localized all user-visible strings (en/uk via tr/trn) instead of gettext _(); fixes Ukrainian text showing under an English KOReader locale.
 -- Version 1.12: renamed the English menu label from "Menu settings" to "Menu customizer".
--- Version 1.13: preserve top-level tabs added at runtime by third-party plugins (custom_tabs_*). They are discovered from the live order table, persisted (id -> label, id -> predecessor) and re-injected into KOMenu:menu_buttons in the generated override file so they are not dropped. The tab contents are intentionally left untouched: the override never emits the tab's item-list key.
--- Version 1.14: custom-tab items are editable again (children are discovered under the tab and shown in its submenu). Keeps the empty-tab safeguard (the tab's item-list key is emitted only when a non-empty child list was discovered) and stops pruning the disable flag of custom-tab items, so a disabled child stays disabled across restarts.
+-- Version 1.13: availability is now re-synced from the flat menu registry on every menu build, so an item whose plugin was disabled since it was last seen stops being reported as available.
+-- Version 1.14: "hide unavailable items" now also applies to the reorder/move views (item list, container chooser, move destination chooser).
+-- Version 1.15: custom separators can be inserted/deleted, and several separators per menu are kept (applyItemsOrder no longer collapses them into one).
+-- Version 1.16: the reorder/move container chooser is now hierarchical: each tab is followed by its own submenus (indented), then the next tab.
+-- Version 1.17: вкладка Reader у ФМ — локалізована назва і приховання з редактора (вкладка-дія).
+-- Version 1.18: sorting_hint тепер поважає вкладені підменю (screen_eink_opt, physical_buttons_setup): пункт більше не їде в першу вкладку; для inline-підменю без ключа в order розміщення лишається за штатним MenuSorter.
 
 local ButtonDialog = require("ui/widget/buttondialog")
 local DataStorage = require("datastorage")
+local Device = require("device")
 local InfoMessage = require("ui/widget/infomessage")
 local Menu = require("ui/widget/menu")
 local SortWidget = require("ui/widget/sortwidget")
@@ -101,7 +106,7 @@ end
 local TAB_IDS = {
     navi = true, typeset = true, setting = true, tools = true,
     search = true, filemanager = true, main = true, plus_menu = true,
-    filemanager_settings = true,
+    filemanager_settings = true, reader = true,
 }
 
 local function stripTabEntries(cache)
@@ -168,10 +173,6 @@ local function loadSettingsFromDisk()
             data.custom_items_filemanager = data.custom_items_filemanager or {}
             data.items_order_reader = data.items_order_reader or {}
             data.items_order_filemanager = data.items_order_filemanager or {}
-            data.custom_tabs_reader = data.custom_tabs_reader or {}
-            data.custom_tabs_filemanager = data.custom_tabs_filemanager or {}
-            data.custom_tabs_after_reader = data.custom_tabs_after_reader or {}
-            data.custom_tabs_after_filemanager = data.custom_tabs_after_filemanager or {}
             -- Inline submenu caches moved to INLINE_SETTINGS_FILE in v1.9. Keep
             -- the legacy embedded arrays for a one-time migration, then drop
             -- them from the settings table so they are no longer serialized.
@@ -209,10 +210,6 @@ local function loadSettingsFromDisk()
         custom_items_order_filemanager = {},
         items_order_reader = {},
         items_order_filemanager = {},
-        custom_tabs_reader = {},
-        custom_tabs_filemanager = {},
-        custom_tabs_after_reader = {},
-        custom_tabs_after_filemanager = {},
         hide_unavailable = true,
     }
 end
@@ -386,7 +383,7 @@ local function saveSettings(settings)
     local function writeTextCache(name, tbl)
         out("    " .. name .. " = {\n")
         for k, v in pairs(tbl) do
-            if type(v) == "string" then
+            if type(v) == "string" and v ~= "" then
                 out(string.format("        [%q] = %q,\n", k, v))
             elseif v == false then
                 out(string.format("        [%q] = false,\n", k))
@@ -431,10 +428,6 @@ local function saveSettings(settings)
     writeOrderedItems("custom_items_order_filemanager", settings.custom_items_order_filemanager or {})
     writeOrderedItems("items_order_reader", settings.items_order_reader or {})
     writeOrderedItems("items_order_filemanager", settings.items_order_filemanager or {})
-    writeTextCache("custom_tabs_reader", settings.custom_tabs_reader or {})
-    writeTextCache("custom_tabs_filemanager", settings.custom_tabs_filemanager or {})
-    writeTextCache("custom_tabs_after_reader", settings.custom_tabs_after_reader or {})
-    writeTextCache("custom_tabs_after_filemanager", settings.custom_tabs_after_filemanager or {})
     out(string.format("    hide_unavailable = %s,\n", settings.hide_unavailable and "true" or "false"))
     out("}\n")
 
@@ -598,7 +591,12 @@ local function applyItemsOrder(order, items_order)
     local mentioned = {}
     for _, ordered_ids in pairs(items_order) do
         for _, id in ipairs(ordered_ids) do
-            mentioned[id] = true
+            -- Separators are not "items": they may legitimately repeat, and
+            -- mentioning one must not suppress the default separators of
+            -- other parents.
+            if id ~= SEPARATOR_ID then
+                mentioned[id] = true
+            end
         end
     end
 
@@ -618,13 +616,20 @@ local function applyItemsOrder(order, items_order)
             local result = {}
             local seen = {}
             for _, id in ipairs(ordered_ids) do
-                if not seen[id] and (known[id] or id == SEPARATOR_ID) then
+                if id == SEPARATOR_ID then
+                    -- Several separators may be placed in one menu (the user
+                    -- can insert them from the reorder widget), so unlike
+                    -- regular ids they are never deduplicated.
+                    table.insert(result, id)
+                elseif not seen[id] and known[id] then
                     table.insert(result, id)
                     seen[id] = true
                 end
             end
             for _, id in ipairs(order[parent_id]) do
-                if not seen[id] and not mentioned[id] then
+                -- Default separators come only from the override list above:
+                -- appending them here would re-create ones the user removed.
+                if id ~= SEPARATOR_ID and not seen[id] and not mentioned[id] then
                     table.insert(result, id)
                     seen[id] = true
                 end
@@ -634,76 +639,11 @@ local function applyItemsOrder(order, items_order)
     end
 end
 
---- Re-inject top-level tabs added at runtime by third-party plugins into the
---- pristine order (they are absent from the file on disk). Each tab is placed
---- right after the tab that preceded it when it was first discovered.
---- We materialize order[tab_id] (so the editor can show and toggle the tab's
---- items) ONLY when a non-empty child list was discovered for it. If nothing
---- was discovered, order[tab_id] is left nil: the generated override then
---- omits the tab's item-list key entirely, so MenuSorter keeps the plugin's
---- own runtime list verbatim instead of replacing it with an empty snapshot.
-local function injectCustomTabs(order, settings, mode)
-    local tabs = (mode == "reader") and settings.custom_tabs_reader or settings.custom_tabs_filemanager
-    local afters = (mode == "reader") and settings.custom_tabs_after_reader or settings.custom_tabs_after_filemanager
-    local custom_items_order = (mode == "reader") and settings.custom_items_order_reader or settings.custom_items_order_filemanager
-    local buttons = order["KOMenu:menu_buttons"]
-    if type(tabs) ~= "table" or type(buttons) ~= "table" then return end
-
-    local present = {}
-    for _, id in ipairs(buttons) do present[id] = true end
-
-    local pending = {}
-    for id in pairs(tabs) do
-        local children = custom_items_order and custom_items_order[id]
-        if type(children) == "table" and #children > 0 and type(order[id]) ~= "table" then
-            order[id] = {}
-        end
-        if not present[id] then
-            table.insert(pending, id)
-        end
-    end
-    table.sort(pending)
-
-    while #pending > 0 do
-        local remaining = {}
-        local progress = false
-        for _, id in ipairs(pending) do
-            local after = afters and afters[id] or ""
-            local idx
-            if after == "" then
-                idx = 0
-            else
-                for i, b in ipairs(buttons) do
-                    if b == after then
-                        idx = i
-                        break
-                    end
-                end
-            end
-            if idx then
-                table.insert(buttons, idx + 1, id)
-                progress = true
-            else
-                table.insert(remaining, id)
-            end
-        end
-        if not progress then
-            -- Predecessor is gone: just append the leftovers.
-            for _, id in ipairs(remaining) do
-                table.insert(buttons, id)
-            end
-            break
-        end
-        pending = remaining
-    end
-end
-
 --- Get the effective order table for a given mode, merging the default
 --- built-in order with any dynamically discovered custom menu items from
 --- third-party plugins.
 local function getEffectiveOrder(mode, settings)
     local order = getDefaultOrder(mode)
-    injectCustomTabs(order, settings, mode)
     local custom_items_order = (mode == "reader") and settings.custom_items_order_reader or settings.custom_items_order_filemanager
     if custom_items_order then
         -- Insert custom items in the saved deterministic order
@@ -768,7 +708,7 @@ local function serializeOrder(order)
     for _, k in ipairs(keys) do
         local v = order[k]
         if type(v) == "table" then
-            table.insert(lines, string.format("    [%q] = {", k))
+            table.insert(lines, string.format("    %s = {", k))
             for _, item in ipairs(v) do
                 table.insert(lines, string.format("        %q,", item))
             end
@@ -891,6 +831,7 @@ local ENGLISH_SOURCES = {
     main                 = { "More tools", "Додатково" },
     -- plus_menu            = { "Plus menu", "Додаткове меню" },
     filemanager_settings = { "File browser", "Файловий менеджер" },
+    reader               = { "Reader", "Читання" },
     -- Submenus (may not have explicit text entries in tab_item_table)
     -- navi_settings        = { "Settings", "Налаштування" },
     -- document             = { "Document", "Документ" },
@@ -975,14 +916,6 @@ local function resolveTabLabel(tab_id, text_lookup)
     local source = localizedSource(tab_id)
     if source then
         return source
-    end
-    -- Tabs added by third-party plugins: label remembered at discovery time.
-    local s = getSettings()
-    for _, tbl in ipairs({ s.custom_tabs_reader, s.custom_tabs_filemanager }) do
-        local label = type(tbl) == "table" and tbl[tab_id]
-        if type(label) == "string" and label ~= "" then
-            return label
-        end
     end
     return tab_id
 end
@@ -1089,6 +1022,28 @@ local function collectAllIds(order)
     return ids
 end
 
+--- Collect ids that appear as children anywhere in the order table. A nested
+--- submenu such as "screen_eink_opt" or "physical_buttons_setup" has no key of
+--- its own: it is only referenced from order.screen / order.navigation, and its
+--- children come from the widget's own sub_item_table. MenuSorter:sort attaches
+--- sorting_hint items with the recursive findById(), so such a hint is valid
+--- even though order[hint] is nil.
+local function collectNestedSubmenuIds(order)
+    local nested = {}
+    for parent_id, list in pairs(order) do
+        if type(list) == "table"
+                and parent_id ~= "KOMenu:menu_buttons"
+                and parent_id ~= "KOMenu:disabled" then
+            for _, id in ipairs(list) do
+                if id ~= SEPARATOR_ID then
+                    nested[id] = true
+                end
+            end
+        end
+    end
+    return nested
+end
+
 --- Collect all known IDs (both menu array items and table keys) from an order table
 local function collectKnownIds(order)
     local ids = {}
@@ -1103,6 +1058,51 @@ local function collectKnownIds(order)
         end
     end
     return ids
+end
+
+--- Keep the per-mode availability knowledge in sync with the ids that the menu
+--- builder actually registered in this session.
+---
+--- The text cache doubles as an availability cache: a string means "present,
+--- label known", the boolean `false` means "confirmed absent in this mode".
+--- Until now only live text could write the tombstone, and mergeTextCache is
+--- never allowed to overwrite an existing string (a transient miss must not
+--- erase a positive result). As a consequence an item whose plugin has since
+--- been disabled kept being shown as present with its stale cached label —
+--- the plugin's editor only ever iterated the static menu_order table.
+---
+--- The flat `item_table` handed to MenuSorter:mergeAndSort is the authoritative
+--- list of ids registered by all widgets/plugins, *before* the user's own
+--- disabled items are removed by the menu order override. That makes it the
+--- right source of truth for "does this id exist in this mode at all":
+---   * id present -> the item exists: drop a stale tombstone so it shows up
+---                   again (its label is refilled by mergeTextCache once live
+---                   text is available).
+---   * id absent  -> no plugin/widget provides it in this mode (plugin
+---                   disabled/missing, device- or build-specific item):
+---                   tombstone it, which is what "hide unavailable items"
+---                   acts on.
+--- Items disabled through this plugin are still registered in item_table, so
+--- they are never mistaken for unavailable ones.
+local function syncMenuAvailability(mode, item_table, settings)
+    if type(item_table) ~= "table" then return false end
+    local cache = (mode == "reader") and settings.text_cache_reader or settings.text_cache_filemanager
+    if type(cache) ~= "table" then return false end
+
+    local changed = false
+    local expected_ids = collectAllIds(getEffectiveOrder(mode, settings))
+    for id in pairs(expected_ids) do
+        if item_table[id] ~= nil then
+            if cache[id] == false then
+                cache[id] = nil
+                changed = true
+            end
+        elseif cache[id] ~= false then
+            cache[id] = false
+            changed = true
+        end
+    end
+    return changed
 end
 
 --- Merge the live (currently accurate) text_lookup for the active mode
@@ -1392,6 +1392,7 @@ end
 local HIDDEN_TABS = {
     plus_menu = true,    -- FM: empty placeholder, not a real menu
     filemanager = true,  -- Reader: just a button to switch back to FM
+    reader = true,       -- FM: opens the last document, an action rather than a menu
 }
 
 --- Build a sub_item_table for a submenu's contents.
@@ -1503,7 +1504,13 @@ local function buildSubmenuItems(submenu_id, order, disabled_items, disabled_tab
             elseif inline_info and inline_info.children and #inline_info.children > 0 then
                 -- Recursively build inline submenu
                 local localized, status = resolveItemLabel(item_id, text_lookup, other_mode_cache)
-                if (not localized or localized == item_id) and inline_info.text and inline_info.text ~= "" then
+                -- Only fall back to the cached inline label when the parent is
+                -- not confirmed unavailable: the inline cache is a union that
+                -- deliberately keeps old entries, so it must not resurrect an
+                -- item whose plugin is gone (status "unavailable").
+                if status ~= "unavailable"
+                        and (not localized or localized == item_id)
+                        and inline_info.text and inline_info.text ~= "" then
                     localized = inline_info.text
                     status = "ok"
                 end
@@ -1560,31 +1567,77 @@ local function buildSubmenuItems(submenu_id, order, disabled_items, disabled_tab
 end
 
 --- Build an ordered list of every reorderable container (top-level tabs and
---- nested submenus) for a given order table. Tabs keep their menu_buttons
---- order; submenus are appended sorted by id.
-local function buildReorderableMenus(order)
+--- nested submenus) for a given order table, as a tree flattened into a list:
+--- each tab is followed by its own submenus (recursively), then the next tab.
+--- Every entry carries `depth` (0 = tab, 1+ = nested submenu) so the caller
+--- can indent it. Submenus whose parent is hidden are still appended (after
+--- the visible tabs, alphabetically) so they never become unreachable.
+--- Unavailable submenus (no plugin registers them anymore) are skipped when
+--- `hide_unavailable` is on, together with their own children; tabs always stay
+--- because their labels are hardcoded and they never carry an availability
+--- status.
+local function buildReorderableMenus(order, settings, text_lookup, other_mode_cache)
     local list = {}
     local seen = {}
+    local hide_unavailable = settings and settings.hide_unavailable
+    local tab_ids = {}
+    for _, tab_id in ipairs(order["KOMenu:menu_buttons"] or {}) do
+        tab_ids[tab_id] = true
+    end
+
+    local function is_submenu(id)
+        return not tab_ids[id]
+            and id ~= "KOMenu:menu_buttons"
+            and id ~= "KOMenu:disabled"
+            and type(order[id]) == "table"
+    end
+
+    local function is_unavailable(container_id)
+        if not hide_unavailable then return false end
+        local _, status = resolveItemLabel(container_id, text_lookup, other_mode_cache)
+        return status == "unavailable"
+    end
+
+    --- Append the submenus referenced by `parent_id`, in the order they appear
+    --- in that container's item list, then recurse into each of them.
+    local function addChildren(parent_id, depth)
+        for _, child_id in ipairs(order[parent_id] or {}) do
+            if child_id ~= SEPARATOR_ID and not seen[child_id] and is_submenu(child_id) then
+                seen[child_id] = true
+                if not is_unavailable(child_id) then
+                    table.insert(list, { id = child_id, is_tab = false, depth = depth })
+                    addChildren(child_id, depth + 1)
+                end
+            end
+        end
+    end
 
     for _, tab_id in ipairs(order["KOMenu:menu_buttons"] or {}) do
-        if not HIDDEN_TABS[tab_id] and not seen[tab_id] then
+        if not seen[tab_id] then
             seen[tab_id] = true
-            table.insert(list, { id = tab_id, is_tab = true })
+            if not HIDDEN_TABS[tab_id] then
+                table.insert(list, { id = tab_id, is_tab = true, depth = 0 })
+            end
+            -- Even a hidden service tab may own submenus; keep them reachable.
+            addChildren(tab_id, 1)
         end
     end
 
-    local submenus = {}
-    for submenu_id, items in pairs(order) do
-        if submenu_id ~= "KOMenu:menu_buttons"
-                and submenu_id ~= "KOMenu:disabled"
-                and type(items) == "table"
-                and not seen[submenu_id] then
-            table.insert(submenus, submenu_id)
+    -- Submenus nothing references (or that live in a hidden tab that itself is
+    -- empty) still have to be listed somewhere: append them alphabetically.
+    local leftovers = {}
+    for id in pairs(order) do
+        if not seen[id] and is_submenu(id) then
+            table.insert(leftovers, id)
         end
     end
-    table.sort(submenus)
-    for _, submenu_id in ipairs(submenus) do
-        table.insert(list, { id = submenu_id, is_tab = false })
+    table.sort(leftovers)
+    for _, id in ipairs(leftovers) do
+        seen[id] = true
+        if not is_unavailable(id) then
+            table.insert(list, { id = id, is_tab = false, depth = 1 })
+            addChildren(id, 2)
+        end
     end
 
     return list
@@ -1626,28 +1679,39 @@ end
 --- Show a chooser of all other tabs/submenus to move an item into.
 local function showMoveDestinationChooser(mode, settings, item_id, from_menu_id, text_lookup, other_mode_cache, on_moved)
     local order = getEffectiveOrder(mode, settings)
-    local containers = buildReorderableMenus(order)
+    local containers = buildReorderableMenus(order, settings, text_lookup, other_mode_cache)
     local item_label = resolveItemLabel(item_id, text_lookup, other_mode_cache)
 
     local choices = {}
     local chooser
+    local target_count = 0
     for __, entry in ipairs(containers) do
         local target_id = entry.id
-        if target_id ~= from_menu_id and order[target_id] then
+        if order[target_id] then
             local label = resolveContainerLabel(target_id, entry.is_tab, text_lookup, other_mode_cache)
             local prefix = entry.is_tab and tr("[Tab] ", "[Вкладка] ") or tr("[Menu] ", "[Меню] ")
+            local is_current = (target_id == from_menu_id)
+            if is_current then
+                -- Keep the source container as a non-selectable anchor so its
+                -- submenus stay visually attached to it in the tree.
+                label = label .. " " .. tr("(current)", "(поточне)")
+            else
+                target_count = target_count + 1
+            end
             table.insert(choices, {
                 text = prefix .. label,
-                callback = function()
+                indent = Device.screen:scaleBySize(18) * (entry.depth or 0),
+                select_enabled = not is_current,
+                callback = (not is_current) and function()
                     UIManager:close(chooser)
                     moveItemToMenu(mode, settings, item_id, from_menu_id, target_id)
                     if on_moved then on_moved() end
-                end,
+                end or nil,
             })
         end
     end
 
-    if #choices == 0 then
+    if target_count == 0 then
         UIManager:show(InfoMessage:new{
             text = tr("There are no other tabs or submenus to move to.", "Немає інших вкладок чи підменю для переміщення."),
         })
@@ -1684,6 +1748,132 @@ local function showReorderSortWidget(mode, settings, menu_id, text_lookup, other
 
     local sort_widget
     local rebuild
+    local showRowActions
+
+    local separator_row_text = tr("--- Separator ---", "--- Розділювач ---")
+
+    --- Persist the widget's current rows (including not yet committed
+    --- reordering) into items_order_<mode> for this parent.
+    local function saveSortList()
+        if not sort_widget then return end
+        local new_list = {}
+        for _, sort_item in ipairs(sort_widget.item_table) do
+            table.insert(new_list, sort_item.item_id)
+        end
+        local items_order = getItemsOrder(settings, mode)
+        items_order[menu_id] = new_list
+        saveSettings(settings)
+    end
+
+    --- Index of a row table in the widget's current list (by identity, so
+    --- duplicate separator rows resolve to the exact one that was long-pressed).
+    local function rowIndex(row)
+        if not sort_widget then return nil end
+        for i, candidate in ipairs(sort_widget.item_table) do
+            if candidate == row then return i end
+        end
+        return nil
+    end
+
+    local function refreshSortWidget()
+        if not sort_widget then return end
+        local rows = #sort_widget.item_table
+        sort_widget.pages = math.max(1, math.ceil(rows / sort_widget.items_per_page))
+        if sort_widget.show_page > sort_widget.pages then
+            sort_widget.show_page = sort_widget.pages
+        end
+        sort_widget:_populateItems()
+    end
+
+    --- Insert a custom separator before/after the given row. MenuSorter drops a
+    --- leading separator and turns neighbouring ones into a single line, so a
+    --- separator is only allowed between two regular items.
+    local function insertSeparator(row, after)
+        local index = rowIndex(row)
+        if not index then return end
+        local at = after and (index + 1) or index
+        local rows = sort_widget.item_table
+        local prev_row = rows[at - 1]
+        local next_row = rows[at]
+        if not prev_row or not next_row
+                or prev_row.item_id == SEPARATOR_ID
+                or next_row.item_id == SEPARATOR_ID then
+            UIManager:show(InfoMessage:new{
+                text = tr("A separator cannot be placed at the start, at the end, or next to another separator.", "Розділювач не можна ставити на початок, у кінець або впритул до іншого розділювача."),
+            })
+            return
+        end
+        table.insert(rows, at, {
+            text = separator_row_text,
+            item_id = SEPARATOR_ID,
+        })
+        sort_widget.marked = 0
+        refreshSortWidget()
+    end
+
+    local function deleteSeparator(row)
+        local index = rowIndex(row)
+        if not index then return end
+        table.remove(sort_widget.item_table, index)
+        sort_widget.marked = 0
+        refreshSortWidget()
+    end
+
+    --- Actions available for a row: move it elsewhere, or manage separators
+    --- around it (separator rows themselves can be deleted).
+    showRowActions = function(row)
+        if not sort_widget or not row or not row.item_id then return end
+        local is_separator = (row.item_id == SEPARATOR_ID)
+        local dialog
+        local buttons = {}
+        if not is_separator then
+            table.insert(buttons, {{
+                text = tr("Move to another tab/menu…", "Перемістити в іншу вкладку/меню…"),
+                align = "left",
+                callback = function()
+                    UIManager:close(dialog)
+                    -- Commit structural edits made in this widget (e.g. inserted
+                    -- separators) before rebuild() re-reads the effective order.
+                    saveSortList()
+                    showMoveDestinationChooser(mode, settings, row.item_id, menu_id, text_lookup, other_mode_cache, rebuild)
+                end,
+            }})
+        end
+        table.insert(buttons, {{
+            text = tr("Insert separator before", "Вставити розділювач перед"),
+            align = "left",
+            callback = function()
+                UIManager:close(dialog)
+                insertSeparator(row, false)
+            end,
+        }})
+        table.insert(buttons, {{
+            text = tr("Insert separator after", "Вставити розділювач після"),
+            align = "left",
+            callback = function()
+                UIManager:close(dialog)
+                insertSeparator(row, true)
+            end,
+        }})
+        if is_separator then
+            table.insert(buttons, {{
+                text = tr("Delete separator", "Видалити розділювач"),
+                align = "left",
+                callback = function()
+                    UIManager:close(dialog)
+                    deleteSeparator(row)
+                end,
+            }})
+        end
+        dialog = ButtonDialog:new{
+            shrink_unneeded_width = true,
+            buttons = buttons,
+            anchor = function()
+                return sort_widget.title_bar.left_button.image.dimen
+            end,
+        }
+        UIManager:show(dialog)
+    end
 
     local function build_sort_items()
         local current_order = getEffectiveOrder(mode, settings)
@@ -1691,19 +1881,22 @@ local function showReorderSortWidget(mode, settings, menu_id, text_lookup, other
         local list = {}
         for __, item_id in ipairs(current_items) do
             if item_id == SEPARATOR_ID then
-                table.insert(list, {
-                    text = tr("--- Separator ---", "--- Розділювач ---"),
+                local row = {
+                    text = separator_row_text,
                     item_id = SEPARATOR_ID,
-                })
+                }
+                row.hold_callback = function() showRowActions(row) end
+                table.insert(list, row)
             else
                 local localized, status = resolveItemLabel(item_id, text_lookup, other_mode_cache)
-                table.insert(list, {
-                    text = decorateLabel(localized, status),
-                    item_id = item_id,
-                    hold_callback = function()
-                        showMoveDestinationChooser(mode, settings, item_id, menu_id, text_lookup, other_mode_cache, rebuild)
-                    end,
-                })
+                if not (settings.hide_unavailable and status == "unavailable") then
+                    local row = {
+                        text = decorateLabel(localized, status),
+                        item_id = item_id,
+                    }
+                    row.hold_callback = function() showRowActions(row) end
+                    table.insert(list, row)
+                end
             end
         end
         return list
@@ -1733,43 +1926,19 @@ local function showReorderSortWidget(mode, settings, menu_id, text_lookup, other
         title = T(tr("Reorder: %1", "Змінити порядок: %1"), menu_label),
         item_table = sort_items,
         callback = function()
-            local new_list = {}
-            for _, sort_item in ipairs(sort_widget.item_table) do
-                table.insert(new_list, sort_item.item_id)
-            end
-            local items_order = getItemsOrder(settings, mode)
-            items_order[menu_id] = new_list
-            saveSettings(settings)
+            saveSortList()
         end,
     }
 
     function sort_widget:onShowWidgetMenu()
-        local this = self
-        local marked_item = (this.marked > 0 and this.item_table[this.marked]) or nil
-        if not marked_item or not marked_item.item_id or marked_item.item_id == SEPARATOR_ID then
+        local marked_item = (self.marked > 0 and self.item_table[self.marked]) or nil
+        if not marked_item then
             UIManager:show(InfoMessage:new{
-                text = tr("First mark an item (tap its row) to move it to another tab or menu.", "Спершу позначте пункт (тап по рядку), щоб перемістити його в іншу вкладку чи меню."),
+                text = tr("First mark an item (tap its row) to move it or add a separator.", "Спершу позначте пункт (тап по рядку), щоб перемістити його або вставити розділювач."),
             })
             return true
         end
-        local dialog
-        dialog = ButtonDialog:new{
-            shrink_unneeded_width = true,
-            buttons = {
-                {{
-                    text = tr("Move to another tab/menu…", "Перемістити в іншу вкладку/меню…"),
-                    align = "left",
-                    callback = function()
-                        UIManager:close(dialog)
-                        showMoveDestinationChooser(mode, settings, marked_item.item_id, menu_id, text_lookup, other_mode_cache, rebuild)
-                    end,
-                }},
-            },
-            anchor = function()
-                return this.title_bar.left_button.image.dimen
-            end,
-        }
-        UIManager:show(dialog)
+        showRowActions(marked_item)
         return true
     end
 
@@ -1779,7 +1948,7 @@ end
 --- Show a chooser of menus/tabs to pick the one whose items to reorder.
 local function showReorderChooser(mode, settings, text_lookup, other_mode_cache)
     local order = getEffectiveOrder(mode, settings)
-    local containers = buildReorderableMenus(order)
+    local containers = buildReorderableMenus(order, settings, text_lookup, other_mode_cache)
 
     if #containers == 0 then
         UIManager:show(InfoMessage:new{
@@ -1796,6 +1965,7 @@ local function showReorderChooser(mode, settings, text_lookup, other_mode_cache)
         local prefix = entry.is_tab and tr("[Tab] ", "[Вкладка] ") or tr("[Menu] ", "[Меню] ")
         table.insert(choices, {
             text = prefix .. label,
+            indent = Device.screen:scaleBySize(18) * (entry.depth or 0),
             callback = function()
                 UIManager:close(chooser)
                 showReorderSortWidget(mode, settings, container_id, text_lookup, other_mode_cache)
@@ -1928,91 +2098,26 @@ end
 -- Plugin lifecycle
 -- ────────────────────────────────────────────────────────────────────
 
---- Discover top-level tabs that a third-party plugin added to the live
---- KOMenu:menu_buttons (they are not part of the pristine order on disk).
---- Persists id -> label and id -> predecessor tab so getEffectiveOrder() can
---- re-inject them. Returns (changed, tab_set) where tab_set holds every known
---- custom tab id (live or remembered), so callers never mistake a tab
---- definition in item_table for an ordinary menu item and never copy the
---- tab's contents into custom_items_order_* (that would make the override
---- file rewrite the plugin's own item list).
-local function discoverCustomTabs(config_prefix, item_table, order, settings, default_order)
-    local tab_set = {}
-    local buttons = order["KOMenu:menu_buttons"]
-    local tabs_key = "custom_tabs_" .. config_prefix
-    local after_key = "custom_tabs_after_" .. config_prefix
-    settings[tabs_key] = settings[tabs_key] or {}
-    settings[after_key] = settings[after_key] or {}
-    local tabs, afters = settings[tabs_key], settings[after_key]
-    local disabled_tabs = (config_prefix == "reader") and settings.reader_tabs_disabled or settings.filemanager_tabs_disabled
-
-    for id in pairs(tabs) do tab_set[id] = true end
-    if type(buttons) ~= "table" then return false, tab_set end
-
-    local default_tabs = {}
-    for _, id in ipairs(default_order["KOMenu:menu_buttons"] or {}) do
-        default_tabs[id] = true
-    end
-
-    local changed = false
-    local live = {}
-    local prev = ""
-    for _, id in ipairs(buttons) do
-        if type(id) == "string" and id ~= SEPARATOR_ID and not default_tabs[id] and not TAB_IDS[id] then
-            live[id] = true
-            tab_set[id] = true
-            local label = tabs[id]
-            local def = type(item_table) == "table" and item_table[id] or nil
-            if type(def) == "table" and type(def.text) == "string" and def.text ~= "" then
-                label = def.text
-            elseif not label then
-                label = id
-            end
-            if tabs[id] ~= label then
-                tabs[id] = label
-                changed = true
-            end
-            -- Remember the position only once, on first discovery: later
-            -- live lists may already have disabled tabs stripped out.
-            if afters[id] == nil then
-                afters[id] = prev
-                changed = true
-            end
-        end
-        prev = id
-    end
-
-    -- Forget tabs that vanished (plugin removed/disabled). A tab the user
-    -- disabled is missing from the live list by design, so keep it.
-    for id in pairs(tabs) do
-        if not live[id] and not (disabled_tabs and disabled_tabs[id]) then
-            tabs[id] = nil
-            afters[id] = nil
-            tab_set[id] = nil
-            local items_order = (config_prefix == "reader") and settings.items_order_reader or settings.items_order_filemanager
-            if items_order then items_order[id] = nil end
-            changed = true
-        end
-    end
-
-    return changed, tab_set
-end
-
 --- Discover third-party plugin items before MenuSorter applies override files.
 --- This catches:
 ---   1. Items explicitly inserted by plugins into submenus of 'order' during addToMainMenu
----   2. Items in 'item_table' that define a sorting_hint
----   3. Items without either, defaulting to the first tab (navi/path)
+---   2. Items in 'item_table' that define a sorting_hint pointing at an order key
+---   3. Items in 'item_table' that define a sorting_hint pointing at a nested
+---      inline submenu (no order key of its own) - placement is left to the
+---      stock MenuSorter, but the item must not be treated as an orphan
+---   4. Items without any of the above, defaulting to the first tab (navi/path)
 local function discoverCustomItemsBeforeSort(config_prefix, item_table, order, settings)
     if not order or type(order) ~= "table" then return false end
     if config_prefix ~= "reader" and config_prefix ~= "filemanager" then return false end
 
     local default_order = getDefaultOrder(config_prefix)
     local known_ids = collectKnownIds(default_order)
-    local tabs_changed, tab_set = discoverCustomTabs(config_prefix, item_table, order, settings, default_order)
-    for id in pairs(tab_set) do
-        known_ids[id] = true -- a custom tab is a container, never a plain item
-    end
+    local nested_ids = collectNestedSubmenuIds(order)
+    -- Items whose placement is owned by the stock MenuSorter's sorting_hint
+    -- handling: never persist them into custom_items (that would require an
+    -- order list, which would replace an inline submenu's native children)
+    -- and never let the orphan pass below move them to the first tab.
+    local handled = {}
     local custom_items = (config_prefix == "reader") and settings.custom_items_reader or settings.custom_items_filemanager
     if not custom_items then
         custom_items = {}
@@ -2049,6 +2154,12 @@ local function discoverCustomItemsBeforeSort(config_prefix, item_table, order, s
     end
 
     -- 2. Discover items in 'item_table' that specify a sorting_hint.
+    --    The hint may be an order key (top-level category or nested
+    --    order-backed submenu like navi_settings) or a nested inline submenu
+    --    (screen_eink_opt, physical_buttons_setup). The latter has no order
+    --    list of its own: creating one would make MenuSorter rebuild the
+    --    submenu from that list and drop the widget's native children, so its
+    --    items are only marked as handled and left to the stock MenuSorter.
     --    pairs() is non-deterministic, so collect and sort for stability.
     if item_table and type(item_table) == "table" then
         local hint_items = {}
@@ -2058,6 +2169,18 @@ local function discoverCustomItemsBeforeSort(config_prefix, item_table, order, s
                     local hint = item_data.sorting_hint
                     if order[hint] and type(order[hint]) == "table" then
                         table.insert(hint_items, { id = item_id, parent = hint })
+                    elseif nested_ids[hint] then
+                        -- Only treat the hint as an inline submenu when the
+                        -- target really is one in this mode. A hint pointing at
+                        -- an absent or leaf item would make the stock
+                        -- MenuSorter fail to attach the item (findById returns
+                        -- nil), so such items keep the old first-tab fallback.
+                        local target = item_table[hint]
+                        if type(target) == "table"
+                                and (type(target.sub_item_table) == "table"
+                                    or type(target.sub_item_table_func) == "function") then
+                            handled[item_id] = true
+                        end
                     end
                 end
             end
@@ -2068,12 +2191,12 @@ local function discoverCustomItemsBeforeSort(config_prefix, item_table, order, s
         end
     end
 
-    -- 3. Only if a plugin item has neither an order insertion nor a sorting_hint,
-    --    default to the first tab (navi/path). Sorted for stability.
+    -- 3. Only if a plugin item has none of the above, default to the first tab
+    --    (navi/path). Sorted for stability.
     if item_table and type(item_table) == "table" then
         local orphans = {}
         for item_id, item_data in pairs(item_table) do
-            if item_id ~= SEPARATOR_ID and not known_ids[item_id] and not discovered[item_id] then
+            if item_id ~= SEPARATOR_ID and not known_ids[item_id] and not discovered[item_id] and not handled[item_id] then
                 if type(item_data) == "table" and item_id ~= "KOMenu:separator" and item_id ~= "KOMenu:disabled" and item_id ~= "KOMenu:menu_buttons" then
                     table.insert(orphans, item_id)
                 end
@@ -2087,7 +2210,7 @@ local function discoverCustomItemsBeforeSort(config_prefix, item_table, order, s
     end
 
     -- Update custom_items hash
-    local changed = tabs_changed
+    local changed = false
     for id, parent in pairs(discovered) do
         if custom_items[id] ~= parent then
             custom_items[id] = parent
@@ -2098,15 +2221,10 @@ local function discoverCustomItemsBeforeSort(config_prefix, item_table, order, s
     -- Prune custom items that are no longer present
     for id in pairs(custom_items) do
         if not discovered[id] then
-            local parent = custom_items[id]
             custom_items[id] = nil
             local disabled_tbl = (config_prefix == "reader") and settings.reader_disabled or settings.filemanager_disabled
             local cache_tbl = (config_prefix == "reader") and settings.text_cache_reader or settings.text_cache_filemanager
-            -- Keep the disable flag for items that belong to a custom tab: a
-            -- disabled child is removed from the live tab list by our own
-            -- override, so on a later re-scan it can look "vanished" and would
-            -- be silently re-enabled. Keeping the flag makes the disable stick.
-            if disabled_tbl and disabled_tbl[id] ~= nil and not (parent and tab_set[parent]) then
+            if disabled_tbl and disabled_tbl[id] ~= nil then
                 disabled_tbl[id] = nil
             end
             if cache_tbl and cache_tbl[id] ~= nil then
@@ -2189,6 +2307,9 @@ function MenuCustomizer:hookMenuSorter()
         if config_prefix == "reader" or config_prefix == "filemanager" then
             local settings = getSettings()
             local changed = discoverCustomItemsBeforeSort(config_prefix, item_table, order, settings)
+            if syncMenuAvailability(config_prefix, item_table, settings) then
+                changed = true
+            end
             local settings_dir = DataStorage:getSettingsDir()
             local override_path = string.format("%s/%s_menu_order.lua", settings_dir, config_prefix)
 
@@ -2382,10 +2503,6 @@ function MenuCustomizer:addToMainMenu(menu_items)
                         custom_items_order_filemanager = {},
                         items_order_reader = {},
                         items_order_filemanager = {},
-                        custom_tabs_reader = {},
-                        custom_tabs_filemanager = {},
-                        custom_tabs_after_reader = {},
-                        custom_tabs_after_filemanager = {},
                         hide_unavailable = true,
                     }
                     saveSettings(settings)
